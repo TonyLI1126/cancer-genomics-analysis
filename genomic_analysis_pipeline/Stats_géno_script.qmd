@@ -1,0 +1,196 @@
+---
+title: "Projet final Stats-Génom"
+author: "Tony LI"
+format: pdf
+editor: visual
+---
+
+# Projet : **cancer-genomics-analysis**
+
+## Introduction 
+
+Ce projet analyse les déterminants génétiques du cancer à partir de deux centres hospitaliers français.
+L'objectif est d'identifier des associations au niveau des SNPs, des gènes (méthode VEGAS) et des pathways (enrichissement de Fisher).
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(qqman)
+library(MASS)
+library(Matrix)
+```
+
+Les données contiennent : annot (annotations), sample1 et sample2 (X, Y, COV)
+
+```{r}
+load("Data_projet_2025_3707snp.RData")
+```
+
+## Prétraitement et Imputation
+
+Nous traitons les données manquantes par dosages génétiques, ce qui correspond à l'espérance du compte des allèles.
+
+```{r}
+data$sample1$Xb <- data$sample1$Xb %>% data$fun$impute_genotype(data$sample1$Yb)
+data$sample2$Xt <- data$sample2$Xt %>% data$fun$impute_genotype(data$sample2$Yt)
+```
+
+```{r}
+n_snps <- ncol(data$sample1$Xb)
+bonf_seuil <- -log10(0.05 / n_snps)
+```
+
+## GWAS (Single Variant Analysis)
+
+Nous effectuons une régression logistique pour chaque SNP, ajustée sur l'âge et les composantes principales (PC) pour corriger la stratification de population.
+
+```{r}
+# --- Échantillon 1 ---
+X1 <- data$sample1$Xb
+Y1 <- data$sample1$Yb
+covar1 <- data$sample1$COVb[, c("age", "PC1", "PC2")] # Exclusion de dep et numind
+
+results1 <- data.frame(snp = colnames(X1), beta = NA, se = NA, pvalue = NA)
+
+for (j in 1:n_snps) {
+  model <- glm(Y1 ~ X1[, j] + age + PC1 + PC2, data = covar1, family = binomial)
+  s <- summary(model)$coefficients
+  if ("X1[, j]" %in% rownames(s)) {
+    results1$beta[j]   <- s["X1[, j]", "Estimate"]
+    results1$se[j]     <- s["X1[, j]", "Std. Error"]
+    results1$pvalue[j] <- s["X1[, j]", "Pr(>|z|)"]
+  }
+}
+```
+
+```{r}
+# --- Échantillon 2 ---
+X2 <- data$sample2$Xt
+Y2 <- data$sample2$Yt
+covar2 <- data$sample2$COVt %>% dplyr::select(-STUDY, -IDU) # Exclusion selon consignes
+
+results2 <- data.frame(snp2 = colnames(X2), beta2 = NA, se2 = NA, pvalue2 = NA)
+
+for (j in 1:n_snps) {
+  model2 <- glm(Y2 ~ X2[, j] + ., data = covar2, family = binomial)
+  s <- summary(model2)$coefficients
+  if ("X2[, j]" %in% rownames(s)) {
+    results2$beta2[j]   <- s["X2[, j]", "Estimate"]
+    results2$se2[j]     <- s["X2[, j]", "Std. Error"]
+    results2$pvalue2[j] <- s["X2[, j]", "Pr(>|z|)"]
+  }
+}
+```
+
+## Méta-analyse et Visualisation
+
+Combinaison des deux études par la méthode de pondération par l'inverse de la variance.
+
+```{r}
+resultsfinal <- results1 %>%
+  mutate(
+    chr = data$annot$chr,
+    pos = data$annot$pos,
+    gen = data$annot$gene,
+    pathway = data$annot$pathway,
+    beta2 = results2$beta2,
+    se2 = results2$se2,
+    # Calcul des poids
+    w1 = 1 / se^2,
+    w2 = 1 / se2^2,
+    betacombi = (beta * w1 + beta2 * w2) / (w1 + w2),
+    secombi = sqrt(1 / (w1 + w2)),
+    z = betacombi / secombi,
+    z2 = z^2,
+    p_meta = 2 * pnorm(-abs(z))
+  )
+
+# Manhattan Plot
+manhattan(resultsfinal, chr="chr", bp="pos", p="p_meta", snp="snp",
+          genomewideline = bonf_seuil, main="Manhattan Plot : Méta-analyse")
+
+# QQ-Plot pour vérifier l'inflation génomique
+qq(resultsfinal$p_meta, main="Q-Q Plot des p-values combinées")
+```
+
+## Analyse Gène-Phénotype (VEGAS)
+
+Agrégation des signaux au niveau du gène en utilisant la décomposition de Cholesky pour simuler la distribution sous H0 tout en respectant la structure de corrélation (LD).
+
+```{r}
+gene_list <- unique(na.omit(resultsfinal$gen))
+vegas_results <- data.frame()
+
+for (g in gene_list) {
+  snps_gene <- resultsfinal$snp[resultsfinal$gen == g]
+  X_gene <- X1[, colnames(X1) %in% snps_gene, drop = FALSE]
+  
+  if (ncol(X_gene) < 2) next
+  
+  # Statistique observée
+  z2_vals <- resultsfinal$z2[resultsfinal$snp %in% colnames(X_gene)]
+  stat_obs <- sum(z2_vals)
+  
+  # Matrice LD (corrélation)
+  sigma <- cor(X_gene, use = "pairwise.complete.obs")
+  sigma[is.na(sigma)] <- 0
+  
+  # Correction si matrice non définie positive
+  if (min(eigen(sigma)$values) < 1e-10) {
+    sigma <- as.matrix(nearPD(sigma, corr = TRUE)$mat)
+  }
+  
+  # Simulations (n=10,000)
+  n_sim <- 10000
+  C <- t(chol(sigma))
+  Z <- matrix(rnorm(n_sim * ncol(sigma)), nrow = n_sim)
+  sim_stats <- rowSums((Z %*% t(C))^2)
+  
+  vegas_results <- rbind(vegas_results, data.frame(
+    gene = g,
+    n_snps = length(z2_vals),
+    stat_obs = stat_obs,
+    p_vegas = mean(sim_stats > stat_obs)
+  ))
+}
+
+# Identification des gènes candidats (p < 0.05)
+genes_signif <- vegas_results %>% filter(p_vegas < 0.05)
+print(paste("Nombre de gènes significatifs avant correction :", nrow(genes_signif)))
+
+```
+
+## Enrichissement des Pathways (Test de Fisher)
+
+Nous testons si les 10 pathways étudiés contiennent plus de gènes associés que prévu par le hasard.
+
+```{r}
+vegas_annot <- vegas_results %>%
+  left_join(unique(resultsfinal[, c("gen", "pathway")]), by = c("gene" = "gen")) %>%
+  mutate(signif = p_vegas < 0.05)
+
+pathways_list <- unique(na.omit(vegas_annot$pathway))
+enrich_results <- data.frame()
+
+for (pw in pathways_list) {
+  in_pw <- vegas_annot$pathway == pw
+  
+  # Table de contingence
+  mat <- matrix(c(
+    sum(vegas_annot$signif[in_pw]),  sum(vegas_annot$signif[!in_pw]),
+    sum(!vegas_annot$signif[in_pw]), sum(!vegas_annot$signif[!in_pw])
+  ), nrow = 2)
+  
+  enrich_results <- rbind(enrich_results, data.frame(
+    pathway = pw,
+    p_enrich = fisher.test(mat)$p.value
+  ))
+}
+
+# Correction pour tests multiples (FDR)
+enrich_results$p_fdr <- p.adjust(enrich_results$p_enrich, method = "BH")
+print(enrich_results %>% arrange(p_fdr))
+```
+
+## Conclusion 
+
+Bien que certainsgènes présentent des p-values \<0.05, aucune association ne reste significative après correction stricte de Bonferroni ou FDR. Cela suggère une puissance statistique limitée ou une absence d'effet majeur de ces pathways candidats dans ce jeu de données spécifique.
