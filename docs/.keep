@@ -1,3 +1,0 @@
-git rm docs/.keep
-git commit -m "Remove .keep placeholder file"
-git push origin main
